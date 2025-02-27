@@ -65,7 +65,7 @@ def demo_trajopt_collision_free():
     tensor_args = TensorDeviceType()
     world_file = "collision_table.yml"
 
-    robot_file = "franka.yml"
+    robot_file = "robdekon_demo_scanning.yml"
     robot_cfg = RobotConfig.from_dict(
         load_yaml(join_path(get_robot_configs_path(), robot_file))["robot_cfg"]
     )

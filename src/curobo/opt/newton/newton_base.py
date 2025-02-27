@@ -27,7 +27,9 @@ from curobo.rollout.dynamics_model.integration_utils import build_fd_matrix
 from curobo.types.base import TensorDeviceType
 from curobo.types.tensor import T_BDOF, T_BHDOF_float, T_BHValue_float, T_BValue_float, T_HDOF_float
 from curobo.util.torch_utils import get_torch_jit_decorator
+from curobo.util.logger import log_error, log_info
 
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
 
 class LineSearchType(Enum):
     GREEDY = "greedy"
@@ -130,7 +132,8 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         self.current_iteration[:] = 0
         return True
 
-    def _optimize(self, q: T_BHDOF_float, shift_steps=0, n_iters=None):
+    def _optimize(self, q: T_BHDOF_float, shift_steps=0, n_iters=None, robot_jac: TorchJacobian=None, q_init: torch.Tensor=None):
+        log_info("using newton optimizer!")
         with profiler.record_function("newton_base/shift"):
             self._shift(shift_steps)
         # reshape q:
@@ -141,9 +144,10 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
             grad_q = q.detach() * 0.0
         # run opt graph
         if not self.cu_opt_init:
-            self._initialize_opt_iters_graph(q, grad_q, shift_steps=shift_steps)
+            self._initialize_opt_iters_graph(q, grad_q, shift_steps=shift_steps, robot_jac=robot_jac, q_init=q_init)
         for i in range(self.outer_iters):
-            best_q, best_cost, q, grad_q = self._call_opt_iters_graph(q, grad_q)
+            best_q, best_cost, q, grad_q = self._call_opt_iters_graph(q, grad_q, robot_jac, q_init)
+            # print("_________best__________", best_q, best_cost)
             if (
                 not self.fixed_iters
                 and self.use_cuda_update_best_kernel
@@ -165,23 +169,26 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
 
         super().reset()
 
-    def _opt_iters(self, q, grad_q, shift_steps=0):
+    def _opt_iters(self, q, grad_q, shift_steps=0, robot_jac=None, q_init=None):
         q = q.detach()  # .clone()
         grad_q = grad_q.detach()  # .clone()
         for _ in range(self.inner_iters):
             self.i += 1
-            cost_n, q, grad_q = self._opt_step(q.detach(), grad_q.detach())
+            cost_n, q, grad_q = self._opt_step(q.detach(), grad_q.detach(), robot_jac=robot_jac, q_init=q_init)
         if self.store_debug:
             self.debug.append(self.best_q.view(-1, self.action_horizon, self.d_action).clone())
             self.debug_cost.append(self.best_cost.detach().view(-1, 1).clone())
 
         return self.best_q.detach(), self.best_cost.detach(), q.detach(), grad_q.detach()
 
-    def _opt_step(self, q, grad_q):
+    def _opt_step(self, q, grad_q, robot_jac, q_init):
         with profiler.record_function("newton/line_search"):
-            q_n, cost_n, grad_q_n = self._approx_line_search(q, grad_q)
+            # print("prior step direction!!!", grad_q)
+            q_n, cost_n, grad_q_n = self._approx_line_search(q, grad_q, robot_jac, q_init)
+            # print("approximating linear search!!!", q_n, cost_n, grad_q_n)
         with profiler.record_function("newton/step_direction"):
             grad_q = self._get_step_direction(cost_n, q_n, grad_q_n)
+            # print("getting step direciton!!!", grad_q)
         with profiler.record_function("newton/update_best"):
             self._update_best(q_n, grad_q_n, cost_n)
         return cost_n, q_n, grad_q
@@ -219,12 +226,12 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         # x = torch.clamp(x, self.action_lows, self.action_highs)
         return x
 
-    def _compute_cost_gradient(self, x):
+    def _compute_cost_gradient(self, x, robot_jac, q_init):
         x_n = x.detach().requires_grad_(True)
         x_in = x_n.view(
             self.n_problems * self.num_particles, self.action_horizon, self.rollout_fn.d_action
         )
-        trajectories = self.rollout_fn(x_in)  # x_n = (batch*line_search_scale) x horizon x d_action
+        trajectories = self.rollout_fn(x_in, robot_jac=robot_jac, q_init=q_init)  # x_n = (batch*line_search_scale) x horizon x d_action
         if len(trajectories.costs.shape) == 2:
             cost = torch.sum(
                 trajectories.costs.view(self.n_problems, self.num_particles, self.horizon),
@@ -233,14 +240,19 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
             )
         else:
             cost = trajectories.costs.view(self.n_problems, self.num_particles, 1)
+        # print("x_n before backward", x_n.grad)
+        # print("_____cost______", cost)
+        # print("self.l_vec", self.l_vec)
+
         g_x = cost.backward(gradient=self.l_vec, retain_graph=False)
+        # print("x_n grad", x_n.grad)
         g_x = x_n.grad.detach()
         return (
             cost,
             g_x,
         )  # cost: [n_problems, n_particles, 1], g_x: [n_problems, n_particles, horizon*d_action]
 
-    def _wolfe_line_search(self, x, step_direction):
+    def _wolfe_line_search(self, x, step_direction, robot_jac, q_init):
         # x_set = get_x_set_jit(step_direction, x, self.alpha_list, self.action_lows, self.action_highs)
 
         step_direction = step_direction.detach()
@@ -252,7 +264,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         x_set = x_set.detach().requires_grad_(True)
 
         b, h, _ = x_set.shape
-        c, g_x = self._compute_cost_gradient(x_set)
+        c, g_x = self._compute_cost_gradient(x_set, robot_jac, q_init)
         with torch.no_grad():
             if not self.use_cuda_line_search_kernel:
                 c_0 = c[:, 0:1]
@@ -353,7 +365,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
                 best_grad_n = best_grad_n.view(b, 1, self.d_opt)
                 return best_x_n, best_c_n, best_grad_n
 
-    def _greedy_line_search(self, x, step_direction):
+    def _greedy_line_search(self, x, step_direction, robot_jac, q_init):
         step_direction = step_direction.detach()
         x_set = x.unsqueeze(-2) + self.alpha_list * step_direction.unsqueeze(-2)
         x_set = self.clip_bounds(x_set)
@@ -362,7 +374,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         x_set = x_set.detach().requires_grad_(True)
         b, h, _ = x_set.shape
 
-        c, g_x = self._compute_cost_gradient(x_set)
+        c, g_x = self._compute_cost_gradient(x_set, robot_jac, q_init)
 
         best_c, m_idx = torch.min(c, dim=-2)
 
@@ -375,7 +387,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
 
         return best_x, best_c, best_grad
 
-    def _armijo_line_search(self, x, step_direction):
+    def _armijo_line_search(self, x, step_direction, robot_jac, q_init):
         step_direction = step_direction.detach()
         step_vec = step_direction.unsqueeze(-2)
         x_set = x.unsqueeze(-2) + self.alpha_list * step_vec
@@ -383,7 +395,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         x_set = x_set.detach().requires_grad_(True)
         b, h, _ = x_set.shape
 
-        c, g_x = self._compute_cost_gradient(x_set)
+        c, g_x = self._compute_cost_gradient(x_set, robot_jac, q_init)
 
         c_0 = c[:, 0:1]
         g_0 = g_x[:, 0:1]
@@ -413,7 +425,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         best_grad = g_x[m].view(b, 1, self.d_opt)
         return best_x, best_c, best_grad
 
-    def _approx_line_search(self, x, step_direction):
+    def _approx_line_search(self, x, step_direction, robot_jac, q_init):
         if self.step_scale != 0.0 and self.step_scale != 1.0:
             step_direction = self.scale_step_direction(step_direction)
         if self.line_search_type == LineSearchType.GREEDY:
@@ -425,7 +437,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
             LineSearchType.STRONG_WOLFE,
             LineSearchType.APPROX_WOLFE,
         ]:
-            return self._wolfe_line_search(x, step_direction)
+            return self._wolfe_line_search(x, step_direction, robot_jac, q_init)
 
     def check_convergence(self, cost):
         above_threshold = cost > self.cost_convergence
@@ -494,9 +506,10 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         self.cu_opt_init = False
         super().update_nproblems(n_problems)
 
-    def _initialize_opt_iters_graph(self, q, grad_q, shift_steps):
+    def _initialize_opt_iters_graph(self, q, grad_q, shift_steps, robot_jac=None, q_init=None):
+        print("initializing!!!")
         if self.use_cuda_graph:
-            self._create_opt_iters_graph(q, grad_q, shift_steps)
+            self._create_opt_iters_graph(q, grad_q, shift_steps, robot_jac=robot_jac, q_init=q_init)
         self.cu_opt_init = True
 
     def _create_box_line_search(self, line_search_scale):
@@ -514,7 +527,7 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         d = torch.stack(d, dim=0).unsqueeze(0)
         return d
 
-    def _call_opt_iters_graph(self, q, grad_q):
+    def _call_opt_iters_graph(self, q, grad_q, robot_jac, q_init):
         if self.use_cuda_graph:
             self._cu_opt_q_in.copy_(q.detach())
             self._cu_opt_gq_in.copy_(grad_q.detach())
@@ -526,9 +539,9 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
                 self._cu_gq.clone(),
             )
         else:
-            return self._opt_iters(q, grad_q)
+            return self._opt_iters(q, grad_q, robot_jac=robot_jac, q_init=q_init)
 
-    def _create_opt_iters_graph(self, q, grad_q, shift_steps):
+    def _create_opt_iters_graph(self, q, grad_q, shift_steps, robot_jac=None, q_init=None):
         # create a new stream:
         self._cu_opt_q_in = q.detach().clone()
         self._cu_opt_gq_in = grad_q.detach().clone()
@@ -538,14 +551,14 @@ class NewtonOptBase(Optimizer, NewtonOptConfig):
         with torch.cuda.stream(s):
             for _ in range(3):
                 self._cu_opt_q, self._cu_opt_cost, self._cu_q, self._cu_gq = self._opt_iters(
-                    self._cu_opt_q_in, self._cu_opt_gq_in, shift_steps
+                    self._cu_opt_q_in, self._cu_opt_gq_in, shift_steps, robot_jac=robot_jac, q_init=q_init
                 )
         torch.cuda.current_stream(device=self.tensor_args.device).wait_stream(s)
 
         self.cu_opt_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.cu_opt_graph, stream=s):
             self._cu_opt_q, self._cu_opt_cost, self._cu_q, self._cu_gq = self._opt_iters(
-                self._cu_opt_q_in, self._cu_opt_gq_in, shift_steps
+                self._cu_opt_q_in, self._cu_opt_gq_in, shift_steps, robot_jac=robot_jac, q_init=q_init
             )
 
 

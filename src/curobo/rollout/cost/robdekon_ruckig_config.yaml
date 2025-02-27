@@ -1,0 +1,26 @@
+wandb:
+  project: ICRA-25-Dual-Arm
+  entity: &entity 'x-huang'
+  group: &group 'redekon_120k_curobo'
+  name: &name 'Skip Connection Sweep - Curobo'
+
+train:
+  batch_size: 1024
+  epochs: 200
+  warmup_epochs: 0
+  lr: 0.001
+  lr_scheduler:
+    step_size: 10
+    gamma: 0.1
+  lr_decay: 0.1
+  wd: 0.0
+  device: 'cuda'
+#  dataset_file: &dataset_file '../data/robdekon_execution_time_data_fewer_collision_250k.h5'
+  dataset_file: &dataset_file '../data/robdekon_execution_time_data_with_collision_120k.h5'
+  target_type: &target_type 'curobo'
+
+model:
+  mlp:
+    hidden_dim: 512
+    n_layers: 6  # One input layer, one output layer, and n_layers-2 hidden layers
+    dropout: 0.0

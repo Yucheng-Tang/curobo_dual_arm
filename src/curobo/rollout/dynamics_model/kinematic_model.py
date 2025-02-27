@@ -34,6 +34,9 @@ from curobo.util.helpers import list_idx_if_not_none
 from curobo.util.logger import log_error, log_info
 from curobo.util.state_filter import FilterConfig, JointStateFilter
 
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
+
 
 @dataclass
 class TimeTrajConfig:
@@ -439,6 +442,7 @@ class KinematicModel(KinematicModelConfig):
         start_state: JointState,
         act_seq: torch.Tensor,
         start_state_idx: Optional[torch.Tensor] = None,
+        robot_jac: TorchJacobian = None,
     ) -> KinematicModelState:
         # filter state if needed:
         start_state_shaped = start_state  # .unsqueeze(1)
@@ -464,7 +468,13 @@ class KinematicModel(KinematicModelConfig):
                 link_pos_seq,
                 link_quat_seq,
                 link_spheres,
-            ) = self.robot_model.forward(state_seq.position.view(shape_tup))
+            ) = self.robot_model.forward(state_seq.position.view(shape_tup), robot_jac=robot_jac)
+
+        # if lin_jac_seq is not None and ang_jac_seq is not None:
+            # print("___debug___: ", lin_jac_seq.shape, ang_jac_seq.shape)
+        # else:
+            # print("___debug___: ", lin_jac_seq, ang_jac_seq)
+
         link_pos_seq = link_pos_seq.view(
             ((curr_batch_size, num_traj_points, link_pos_seq.shape[1], 3))
         )

@@ -51,18 +51,35 @@ cost:
   self_collision_cfg:
     weight: 500.0
     classify: False
+#  manipulability_cfg:
+#    use_joint_limits: False
+#    hinge_value: 10.0
+#    weight: 100.0
+#  relative_pose_cfg:
+#    vec_weight: [ 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 ]
+#    weight: [ 30, 50, 10, 10 ] #[20.0, 100.0]
+#    vec_convergence: [ 0.00, 0.000 ] # orientation, position
+#    terminal: False
+#    use_metric: True
+#    run_weight: 1.0
+  traj_exec_cfg:
+    use_trajectory_length: True
+    use_curobo_traj_time: False
+    # hinge_value: 10.0
+#    weight: 20.0 # 2.0
+    weight: 0.0 # 2.0
 
 
 mppi:
   init_cov          : 1.0 #0.15 #.5 #.5
   gamma             : 1.0
-  n_iters           : 4
+  n_iters           : 20
   cold_start_n_iters: null
   step_size_mean    : 0.9
   step_size_cov     : 0.1
   beta              : 0.01
   alpha             : 1
-  num_particles     : 25 #10000
+  num_particles     : 25 #25 10000
   update_cov        : True
   cov_type          : "DIAG_A" # 
   kappa             : 0.01

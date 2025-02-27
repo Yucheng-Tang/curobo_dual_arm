@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 # Third Party
 import torch
 import torch.autograd.profiler as profiler
+from torch.autograd import grad
 
 # CuRobo
 from curobo.cuda_robot_model.cuda_robot_generator import (
@@ -32,6 +33,19 @@ from curobo.types.math import Pose
 from curobo.types.state import JointState
 from curobo.util.logger import log_error
 from curobo.util_file import get_robot_path, join_path, load_yaml
+
+import pytorch_kinematics as pk
+from curobo.util_file import get_robot_configs_path
+import pytorch3d.transforms as transforms
+
+import time
+import scipy.optimize as O
+import numpy as np
+
+import math
+
+from copy import deepcopy
+
 
 
 @dataclass
@@ -53,6 +67,7 @@ class CudaRobotModelConfig:
         urdf_path: str,
         base_link: str,
         ee_link: str,
+        link_names: Optional[List[str]] = None,
         tensor_args: TensorDeviceType = TensorDeviceType(),
     ) -> CudaRobotModelConfig:
         """Load a cuda robot model from only urdf. This does not support collision queries.
@@ -66,7 +81,7 @@ class CudaRobotModelConfig:
         Returns:
             CudaRobotModelConfig: cuda robot model configuration.
         """
-        config = CudaRobotGeneratorConfig(base_link, ee_link, tensor_args, urdf_path=urdf_path)
+        config = CudaRobotGeneratorConfig(base_link, ee_link, tensor_args, link_names, urdf_path=urdf_path)
         return CudaRobotModelConfig.from_config(config)
 
     @staticmethod
@@ -264,7 +279,7 @@ class CudaRobotModel(CudaRobotModelConfig):
                 )
 
     @profiler.record_function("cuda_robot_model/forward_kinematics")
-    def forward(self, q, link_name=None, calculate_jacobian=False):
+    def forward(self, q, link_name=None, calculate_jacobian=True, robot_jac=None):
         # pos, rot = self.compute_forward_kinematics(q, qd, link_name)
         if len(q.shape) > 2:
             raise ValueError("q shape should be [batch_size, dof]")
@@ -273,6 +288,8 @@ class CudaRobotModel(CudaRobotModelConfig):
 
         # do fused forward:
         link_pos_seq, link_quat_seq, link_spheres_tensor = self._cuda_forward(q)
+
+        # print("_________________________________", self._cuda_backward(q))
 
         if len(self.link_names) == 1:
             ee_pos = link_pos_seq.squeeze(1)
@@ -285,9 +302,30 @@ class CudaRobotModel(CudaRobotModelConfig):
             ee_quat = link_quat_seq.contiguous()[..., link_idx, :]
         lin_jac = ang_jac = None
 
+        # print("___debug robot_jac___: ", robot_jac)
+
         # compute jacobians?
-        if calculate_jacobian:
-            raise NotImplementedError
+        if calculate_jacobian and robot_jac is not None:
+            # link_idx = self.kinematics_config.ee_idx
+
+            q_grad = torch.tensor(q, dtype=torch.float32, device="cuda", requires_grad=True)
+            # q_grad = torch.rand(2, 7, dtype=torch.float32, device="cuda", requires_grad=True)
+
+            lin_jac, ang_jac = robot_jac.get_jacobian(q_grad, link_pos_seq, link_quat_seq)
+            # lin_jac, ang_jac = robot_jac.get_jacobian_test(q, link_pos_seq, link_quat_seq)
+
+            # start_time = time.time()
+            # hessian = robot_jac.cal_hessian(q_grad)
+            # end_time = time.time()
+
+            # # Calculate the elapsed time
+            # elapsed_time = end_time - start_time
+            #
+            # print("Hessian tensor calculation time: {:.4f} seconds".format(elapsed_time))
+            # print(lin_jac, ang_jac, hessian)
+
+
+            # raise NotImplementedError
         return (
             ee_pos,
             ee_quat,
@@ -310,7 +348,7 @@ class CudaRobotModel(CudaRobotModelConfig):
             out[6],
             self.link_names,
         )
-        return state
+        return deepcopy(state)
 
     def get_robot_link_meshes(self):
         m_list = [self.get_link_mesh(l) for l in self.kinematics_config.mesh_link_names]
@@ -400,6 +438,10 @@ class CudaRobotModel(CudaRobotModelConfig):
         )
         return link_pos, link_quat, robot_spheres
 
+    def _cuda_backward(self, q):
+        out = get_cuda_jacobian()
+        return out
+
     @property
     def all_articulated_joint_names(self):
         return self.kinematics_config.non_fixed_joint_names
@@ -485,3 +527,199 @@ class CudaRobotModel(CudaRobotModelConfig):
     @property
     def retract_config(self):
         return self.kinematics_config.cspace.retract_config
+
+
+class TorchJacobian():
+    # def __init__(self, urdf_file: str, ee_link: str):
+    def __init__(self):
+        config_file = load_yaml(join_path(get_robot_configs_path(), "dual_ur10e.yml"))
+        urdf_file = config_file["robot_cfg"]["kinematics"][
+            "urdf_path"
+        ]
+        ee_link = config_file["robot_cfg"]["kinematics"]["ee_link"]
+
+        # for dual_ur10e
+        ee_link_1 = "tool1"
+        self.chain_cpu_1 = pk.build_serial_chain_from_urdf(open("../src/curobo/content/assets/"+urdf_file).read(), ee_link_1)
+
+        self.chain_cpu = pk.build_serial_chain_from_urdf(open("../src/curobo/content/assets/"+urdf_file).read(), ee_link)
+
+        d = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float32
+        self.chain = self.chain_cpu.to(dtype=dtype, device=d)
+        self.chain_1 = self.chain_cpu_1.to(dtype=dtype, device=d)
+
+        self.transform = pk.transforms.Transform3d(device=d, dtype=dtype)
+        # self.transform = transforms.Transform3d(device=d, dtype=dtype)
+        self.j_w = torch.rand(100, 6, 7, device=d, dtype=dtype)
+
+
+    def get_jacobian(self, q: torch.Tensor, ee_pos: torch.Tensor, ee_quat: torch.Tensor) -> torch.Tensor:
+        # print(ee_pos, ee_quat, self.transform.translate(ee_pos))
+        # self.transform = self.transform.translate(ee_pos)
+        J = self.chain.jacobian(q)
+        # lin_jac = ang_jac = None
+
+        # hessian = J[1].backward()
+        # print("_____________Hessian__________", hessian)
+
+        # print("before split")
+        #
+        lin_jac, ang_jac = torch.split(J, 3, dim=1)
+        # lin_jac, ang_jac = torch.split(self.j_w, 3, dim=1)
+
+        #
+        # print("after split")
+        if lin_jac is not None and ang_jac is not None:
+            print("___debug lin_jac, ang_jac___", lin_jac.shape, ang_jac.shape)
+
+        return lin_jac, ang_jac
+        # return J
+
+    def get_jacobian_test(self, q: torch.Tensor, ee_pos: torch.Tensor, ee_quat: torch.Tensor) -> torch.Tensor:
+        print("__________require grad____________", q.requires_grad)
+
+        q_grad = q.requires_grad_()
+
+        fk_result = self.chain.forward_kinematics(q_grad, end_only=True)
+
+        m = fk_result.get_matrix()
+        pos = m[:, :3, 3]
+        rot = pk.matrix_to_quaternion(m[:, :3, :3])
+
+        lin_jac = []
+
+        for i in range(pos.shape[0]):
+            for j in range(pos.shape[1]):
+                print(pos[i, j], q_grad[i])
+                jac_tmp = grad(pos[i, j], q_grad, retain_graph=True)[0][i]
+                lin_jac.append(jac_tmp)
+
+        # lin_jac = pos.backward()
+        print("_______tcp pose______", lin_jac)
+
+        J = self.chain.jacobian(q, self.transform)
+
+        print("_______tcp pose______", J[:, :3, :], lin_jac)
+
+        jacobian = []
+
+        for i in range(fk_result):
+            jacobian.append(grad(fk_result[:, i], q, retain_graph=True, create_graph=True)[0])
+
+        jacobian = torch.stack(jacobian, dim=-1)
+        return jacobian
+
+    def cal_hessian(self, q: torch.Tensor) -> torch.Tensor:
+        # q_grad = q.requires_grad_(True)
+        # q_grad = q[1].requires_grad_(True)
+        J = self.chain.jacobian(q)
+        # print("jacobian require_grad", q.requires_grad, J.requires_grad)
+        hessian = torch.zeros(J.shape[0], J.shape[1], J.shape[2], J.shape[2], device="cuda", dtype=torch.float32)
+        for i in range(J.shape[0]):
+            for j in range(J.shape[1]):
+                for k in range(J.shape[2]):
+                    # print("hessian", i, j, k, torch.autograd.grad(J[i, j, k], q, retain_graph=True)[0][i])
+                    hessian[i, j, k, :] = torch.autograd.grad(J[i, j, k], q, retain_graph=True)[0][i]
+
+        # q_cpu = q.cpu().detach().numpy()
+        # J_cpu = J.cpu().detach().numpy()
+        #
+        #
+        #
+        # hessian_list = []
+        # for i in range(q.shape[0]):
+        #
+        #     g = O.approx_fprime(J, self.objective_function, 7 * [0.001])
+        #     hessian_list.append(g)
+        #
+        # print(hessian_list)
+
+        return hessian
+
+    def objective_function(self, J):
+        jT = np.transpose(J)
+        jjT = np.dot(J, jT)
+        det = abs(np.linalg.det(jjT))
+        manipulability = math.sqrt(det)
+
+        return float(manipulability)
+
+    # def calc_hessian(self, q, tool=None):
+    #     """
+    #     Return the Hessian of the robot's end-effector pose with respect to the joint variables.
+    #     The Hessian is a tensor of shape (N, 6, DOF, DOF), where N is the batch size, 6 represents
+    #     the end-effector's position and orientation, and DOF is the number of joint variables.
+    #
+    #     tool is the transformation wrt the end effector; default is identity. If specified, will have to
+    #     specify for each of the N inputs
+    #     """
+    #     if len(q.shape) <= 1:
+    #         N = 1
+    #         th = q.reshape(1, -1)
+    #     else:
+    #         N = q.shape[0]
+    #     ndof = q.shape[1]
+    #
+    #     h_eef = torch.zeros((N, 6, ndof, ndof), dtype=self.chain.dtype, device=self.chain.device)
+    #
+    #     if tool is None:
+    #         cur_transform = transforms.Transform3d(device=self.chain.device,
+    #                                                dtype=self.chain.dtype).get_matrix().repeat(N, 1, 1)
+    #     else:
+    #         if tool.dtype != self.chain.dtype or tool.device != self.chain.device:
+    #             tool = tool.to(device=self.chain.device, copy=True, dtype=self.chain.dtype)
+    #         cur_transform = tool.get_matrix()
+    #
+    #     for i in range(ndof):
+    #         for j in range(i, ndof):
+    #             cur_transform_i = cur_transform.clone()
+    #             cur_transform_j = cur_transform.clone()
+    #
+    #             for k, f in enumerate(reversed(self.chain._serial_frames)):
+    #                 if f.joint.joint_type == "revolute":
+    #                     axis_i = cur_transform_i[:, :3, :3].transpose(1, 2) @ f.joint.axis
+    #                     eef2joint_pos_i = cur_transform_i[:, :3, 3].unsqueeze(2)
+    #                     joint2eef_rot_i = cur_transform_i[:, :3, :3].transpose(1, 2)
+    #                     eef2joint_pos_in_eef_i = joint2eef_rot_i @ eef2joint_pos_i
+    #
+    #                     axis_j = cur_transform_j[:, :3, :3].transpose(1, 2) @ f.joint.axis
+    #                     eef2joint_pos_j = cur_transform_j[:, :3, 3].unsqueeze(2)
+    #                     joint2eef_rot_j = cur_transform_j[:, :3, :3].transpose(1, 2)
+    #                     eef2joint_pos_in_eef_j = joint2eef_rot_j @ eef2joint_pos_j
+    #
+    #                     if i == j:
+    #                         h_eef[:, :3, i, j] = torch.cross(axis_i, eef2joint_pos_in_eef_i.squeeze(2), dim=1)
+    #                         h_eef[:, 3:, i, j] = axis_i
+    #                     else:
+    #                         d2x_dqjdqi = torch.cross(axis_j,
+    #                                                  torch.cross(axis_i, eef2joint_pos_in_eef_i.squeeze(2), dim=1),
+    #                                                  dim=1)
+    #                         h_eef[:, :3, i, j] = d2x_dqjdqi.squeeze()
+    #                         h_eef[:, 3:, i, j] = torch.cross(axis_j, axis_i, dim=1).squeeze()
+    #
+    #                 elif f.joint.joint_type == "prismatic":
+    #                     if i == j:
+    #                         h_eef[:, :3, i, j] = f.joint.axis.repeat(N, 1) @ cur_transform_i[:, :3, :3]
+    #
+    #                 cur_frame_transform_i = f.get_transform(q[:, i]).get_matrix()
+    #                 cur_frame_transform_j = f.get_transform(q[:, j]).get_matrix()
+    #                 cur_transform_i = cur_frame_transform_i @ cur_transform_i
+    #                 cur_transform_j = cur_frame_transform_j @ cur_transform_j
+    #
+    #         # Transform Hessian to base frame
+    #     pose = self.chain.forward_kinematics(q).get_matrix()
+    #     rotation = pose[:, :3, :3]
+    #     h_tr = torch.zeros((N, 6, 6, 6), dtype=self.chain.dtype, device=self.chain.device)
+    #     h_tr[:, :3, :3, :3] = rotation.unsqueeze(-1)
+    #     h_tr[:, 3:, 3:, 3:] = rotation.unsqueeze(-1)
+    #     h_w = h_tr @ h_eef @ h_tr.transpose(-1, -2)
+    #
+    #     return h_w
+
+    def forward_kinematics(self, q):
+        cur_transform = transforms.Transform3d(device=self.chain.device, dtype=self.chain.dtype).get_matrix()
+        for f in reversed(self.chain._serial_frames):
+            cur_frame_transform = f.get_transform(q).get_matrix()
+            cur_transform = cur_frame_transform @ cur_transform
+        return cur_transform

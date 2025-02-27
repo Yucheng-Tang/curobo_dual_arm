@@ -19,11 +19,15 @@ import torch.autograd.profiler as profiler
 
 # CuRobo
 from curobo.opt.newton.newton_base import NewtonOptBase
+from curobo.opt.nullspace.nullspace_base import NullspaceOptBase
 from curobo.opt.opt_base import Optimizer
 from curobo.opt.particle.particle_opt_base import ParticleOptBase
 from curobo.rollout.rollout_base import Goal, RolloutBase, RolloutMetrics
 from curobo.types.robot import State
 from curobo.util.logger import log_info
+
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
 
 
 @dataclass
@@ -66,9 +70,15 @@ class WrapBase(WrapConfig):
             return self.safety_rollout.get_metrics_cuda_graph(state)
         return self.safety_rollout.get_metrics(state)
 
-    def optimize(self, act_seq: torch.Tensor, shift_steps: int = 0) -> torch.Tensor:
+    def optimize(self, act_seq: torch.Tensor, shift_steps: int = 0, robot_jac: TorchJacobian=None, q_init: torch.Tensor=None) -> torch.Tensor:
         for opt in self.optimizers:
-            act_seq = opt.optimize(act_seq, shift_steps)
+            # print("before opt: ", act_seq)
+            act_seq = opt.optimize(act_seq, shift_steps, robot_jac=robot_jac, q_init=q_init)
+
+            print("_______________________", opt.num_particles, "__________________________")
+
+            # print("after opt: ",act_seq)
+
         return act_seq
 
     def get_debug_data(self):
@@ -131,7 +141,7 @@ class WrapBase(WrapConfig):
     def tensor_args(self):
         return self.safety_rollout.tensor_args
 
-    def solve(self, goal: Goal, seed: Optional[torch.Tensor] = None):
+    def solve(self, goal: Goal, seed: Optional[torch.Tensor] = None, robot_jac: TorchJacobian=None, q_init: torch.Tensor=None):
         metrics = None
 
         filtered_state = self.safety_rollout.filter_robot_state(goal.current_state)
@@ -145,21 +155,27 @@ class WrapBase(WrapConfig):
         start_time = time.time()
         if not self._init_solver:
             log_info("Solver was not initialized, warming up solver")
-            for _ in range(2):
-                act_seq = self.optimize(seed, shift_steps=0)
+            for i in range(2):
+                log_info(str(i)+ " time warming up")
+                act_seq = self.optimize(seed, shift_steps=0, robot_jac=robot_jac, q_init=q_init)
             self._init_solver = True
-        act_seq = self.optimize(seed, shift_steps=0)
+        log_info("warming up finished!")
+        act_seq = self.optimize(seed, shift_steps=0, robot_jac=robot_jac, q_init=q_init)
         self.opt_dt = time.time() - start_time
+
+        print('opt using time: ', self.opt_dt )
 
         act = self.safety_rollout.get_robot_command(
             filtered_state, act_seq, state_idx=goal.batch_current_state_idx
         )
 
         if self.compute_metrics:
+            # print('compute_metrics')
             with profiler.record_function("wrap_base/compute_metrics"):
                 metrics = self.get_metrics(
                     act, self.use_cuda_graph_metrics
                 )  # TODO: use cuda graph for metrics
+            # print(metrics)
 
         result = WrapResult(
             action=act,
@@ -173,6 +189,10 @@ class WrapBase(WrapConfig):
     @property
     def newton_optimizer(self) -> NewtonOptBase:
         return self.optimizers[-1]
+
+    # @property
+    # def nullspace_optimizer(self) -> NullspaceOptBase:
+    #     return self.optimizers[-1]
 
     @property
     def particle_optimizer(self) -> ParticleOptBase:

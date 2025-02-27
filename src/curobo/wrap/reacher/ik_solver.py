@@ -34,12 +34,13 @@ import torch
 import torch.autograd.profiler as profiler
 
 # CuRobo
-from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel, CudaRobotModelState
+from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel, CudaRobotModelState, TorchJacobian
 from curobo.geom.sdf.utils import create_collision_checker
 from curobo.geom.sdf.world import CollisionCheckerType, WorldCollision, WorldCollisionConfig
 from curobo.geom.types import WorldConfig
 from curobo.opt.newton.lbfgs import LBFGSOpt, LBFGSOptConfig
 from curobo.opt.newton.newton_base import NewtonOptBase, NewtonOptConfig
+from curobo.opt.nullspace.nullspace_base import NullspaceOptBase
 from curobo.opt.particle.parallel_es import ParallelES, ParallelESConfig
 from curobo.opt.particle.parallel_mppi import ParallelMPPI, ParallelMPPIConfig
 from curobo.rollout.arm_reacher import ArmReacher, ArmReacherConfig
@@ -49,7 +50,7 @@ from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 from curobo.types.robot import JointState, RobotConfig
 from curobo.types.tensor import T_BDOF, T_DOF, T_BValue_bool, T_BValue_float
-from curobo.util.logger import log_error, log_warn
+from curobo.util.logger import log_error, log_warn, log_info
 from curobo.util.sample_lib import HaltonGenerator
 from curobo.util.torch_utils import get_torch_jit_decorator
 from curobo.util_file import (
@@ -61,6 +62,12 @@ from curobo.util_file import (
 )
 from curobo.wrap.reacher.types import ReacherSolveState, ReacherSolveType
 from curobo.wrap.wrap_base import WrapBase, WrapConfig, WrapResult
+
+import toppra as ta
+import toppra.constraint as constraint
+import toppra.algorithm as algo
+
+import numpy as np
 
 
 @dataclass
@@ -150,6 +157,8 @@ class IKSolverConfig:
         high_precision: bool = False,
         project_pose_to_goal_frame: bool = True,
         seed: int = 1531,
+        robot_jac: TorchJacobian = None,
+        use_nullspace_opt: bool = False,
     ) -> IKSolverConfig:
         """Helper function to load IKSolver configuration from a robot file and world file.
 
@@ -176,7 +185,6 @@ class IKSolverConfig:
                 types of obstacles in more detail.
             tensor_args: Device and floating precision to use for IKSolver.
             num_seeds: Number of seeds to optimize per IK problem in parallel.
-            position_threshold: Position convergence threshold in meters to use to compute success.
             rotation_threshold: Rotation convergence threshold to use to compute success. See
                 :meth:`IKSolverConfig.rotation_threshold` for more details.
             world_coll_checker: Reference to world collision checker to use for collision avoidance.
@@ -225,10 +233,16 @@ class IKSolverConfig:
         config_data = load_yaml(join_path(get_task_configs_path(), particle_file))
         grad_config_data = load_yaml(join_path(get_task_configs_path(), gradient_file))
 
+        # optional parameters between pose_cfg and relative_pose_cfg
         base_config_data["cost"]["pose_cfg"]["project_distance"] = project_pose_to_goal_frame
         base_config_data["convergence"]["pose_cfg"]["project_distance"] = project_pose_to_goal_frame
         config_data["cost"]["pose_cfg"]["project_distance"] = project_pose_to_goal_frame
         grad_config_data["cost"]["pose_cfg"]["project_distance"] = project_pose_to_goal_frame
+
+        # base_config_data["cost"]["relative_pose_cfg"]["project_distance"] = project_pose_to_goal_frame
+        # base_config_data["convergence"]["relative_pose_cfg"]["project_distance"] = project_pose_to_goal_frame
+        # config_data["cost"]["relative_pose_cfg"]["project_distance"] = project_pose_to_goal_frame
+        # grad_config_data["cost"]["relative_pose_cfg"]["project_distance"] = project_pose_to_goal_frame
 
         if collision_cache is not None:
             base_config_data["world_collision_checker_cfg"]["cache"] = collision_cache
@@ -329,6 +343,9 @@ class IKSolverConfig:
         else:
             mppi_cfg = ParallelMPPIConfig(**config_dict)
             parallel_mppi = ParallelMPPI(mppi_cfg)
+
+        print('mppi loaded!')
+        
         config_dict = LBFGSOptConfig.create_data_dict(
             grad_config_data["lbfgs"], arm_rollout_grad, tensor_args
         )
@@ -346,6 +363,11 @@ class IKSolverConfig:
             lbfgs = NewtonOptBase(newton_cfg)
         else:
             lbfgs = LBFGSOpt(lbfgs_cfg)
+
+        if use_nullspace_opt:
+            lbfgs = NullspaceOptBase(lbfgs_cfg)
+
+        print('lbfgs loaded!')
 
         if use_particle_opt:
             opts = [parallel_mppi]
@@ -607,6 +629,8 @@ class IKSolver(IKSolverConfig):
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
         link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian = None,
+        q_init: torch.Tensor = None,
     ) -> IKResult:
         """Solve single IK problem.
 
@@ -663,6 +687,8 @@ class IKSolver(IKSolverConfig):
             use_nn_seed,
             newton_iters,
             link_poses=link_poses,
+            robot_jac=robot_jac,
+            q_init=q_init,
         )
 
     def solve_goalset(
@@ -675,6 +701,9 @@ class IKSolver(IKSolverConfig):
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
         link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian = None,
+        q_init: torch.Tensor = None,
+
     ) -> IKResult:
         """Solve IK problem to reach one pose in a set of poses.
 
@@ -735,6 +764,8 @@ class IKSolver(IKSolverConfig):
             use_nn_seed,
             newton_iters,
             link_poses=link_poses,
+            robot_jac=robot_jac,
+            q_init=q_init,
         )
 
     def solve_batch(
@@ -747,6 +778,8 @@ class IKSolver(IKSolverConfig):
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
         link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian = None,
+        q_init: torch.Tensor = None,
     ) -> IKResult:
         """Solve batch of IK problems.
 
@@ -801,6 +834,8 @@ class IKSolver(IKSolverConfig):
             use_nn_seed,
             newton_iters,
             link_poses=link_poses,
+            robot_jac=robot_jac,
+            q_init=q_init,
         )
 
     def solve_batch_goalset(
@@ -813,6 +848,8 @@ class IKSolver(IKSolverConfig):
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
         link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian = None,
+        q_init: torch.Tensor = None,
     ) -> IKResult:
         """Solve batch of IK problems to reach one pose in a set of poses for a batch of problems.
 
@@ -865,6 +902,8 @@ class IKSolver(IKSolverConfig):
             use_nn_seed,
             newton_iters,
             link_poses=link_poses,
+            robot_jac=robot_jac,
+            q_init=q_init
         )
 
     def solve_batch_env(
@@ -877,6 +916,8 @@ class IKSolver(IKSolverConfig):
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
         link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian = None,
+        q_init: torch.Tensor = None,
     ) -> IKResult:
         """Solve batch of IK problems with each problem in different world environments.
 
@@ -928,6 +969,8 @@ class IKSolver(IKSolverConfig):
             use_nn_seed,
             newton_iters,
             link_poses=link_poses,
+            robot_jac=robot_jac,
+            q_init=q_init,
         )
 
     def solve_batch_env_goalset(
@@ -940,6 +983,8 @@ class IKSolver(IKSolverConfig):
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
         link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian = None,
+        q_init: torch.Tensor = None,
     ) -> IKResult:
         """Solve batch of goalset IK problems with each problem in different world environments.
 
@@ -992,6 +1037,8 @@ class IKSolver(IKSolverConfig):
             use_nn_seed,
             newton_iters,
             link_poses=link_poses,
+            robot_jac=robot_jac,
+            q_init=q_init,
         )
 
     def _solve_from_solve_state(
@@ -1005,6 +1052,8 @@ class IKSolver(IKSolverConfig):
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
         link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian=None,
+        q_init: torch.Tensor = None,
     ) -> IKResult:
         """Solve IK problem from ReacherSolveState. Called by all solve functions.
 
@@ -1042,10 +1091,18 @@ class IKSolver(IKSolverConfig):
         if newton_iters is not None:
             self.solver.newton_optimizer.outer_iters = newton_iters
         self.solver.reset()
-        result = self.solver.solve(goal_buffer, coord_position_seed)
+        result = self.solver.solve(goal_buffer, coord_position_seed, robot_jac, q_init)
+        # print("RESULT: ", result)
         if newton_iters is not None:
             self.solver.newton_optimizer.outer_iters = self.og_newton_iters
-        ik_result = self._get_result(num_seeds, result, goal_buffer.goal_pose, return_seeds)
+        # print('parameter num_seeds sent to _get_result: ', num_seeds)
+        # print('parameter result sent to _get_result: ', result)
+        # print('parameter goal_pose sent to _get_result: ', goal_buffer.goal_pose)
+        # print('parameter return_seeds sent to _get_result: ', return_seeds)
+        ik_result = self._get_result(num_seeds, result, goal_buffer.goal_pose, return_seeds, q_init)
+        # print("SUCCESS?", ik_result.success)
+        # if ik_result.success is False:
+        #     raise IKError("IK Solver failed to solve the problem.")
         if ik_result.goalset_index is not None:
             ik_result.goalset_index[ik_result.goalset_index >= goal_pose.n_goalset] = 0
 
@@ -1053,7 +1110,7 @@ class IKSolver(IKSolverConfig):
 
     @profiler.record_function("ik/get_result")
     def _get_result(
-        self, num_seeds: int, result: WrapResult, goal_pose: Pose, return_seeds: int
+        self, num_seeds: int, result: WrapResult, goal_pose: Pose, return_seeds: int, q_init: torch.Tensor
     ) -> IKResult:
         """Get IKResult from WrapResult after optimization.
 
@@ -1072,8 +1129,12 @@ class IKSolver(IKSolverConfig):
         if result.metrics.cspace_error is not None:
             result.metrics.pose_error += result.metrics.cspace_error
 
+        # print("result:", result.metrics)
+
         q_sol, success, position_error, rotation_error, total_error, goalset_index = get_result(
-            result.metrics.pose_error,
+            result.metrics.cost,
+            # result.metrics.exec_time,
+            # result.metrics.pose_error,
             result.metrics.position_error,
             result.metrics.rotation_error,
             result.metrics.goalset_index,
@@ -1083,11 +1144,13 @@ class IKSolver(IKSolverConfig):
             goal_pose.batch,
             return_seeds,
             num_seeds,
+            q_init
         )
         # check if locked joints exist and create js solution:
 
         new_js = JointState(q_sol, joint_names=self.rollout_fn.kinematics.joint_names)
         sol_js = self.rollout_fn.get_full_dof_from_solution(new_js)
+        print("sol_js: ", sol_js)
         # reindex success to get successful poses?
         ik_result = IKResult(
             success=success,
@@ -1124,6 +1187,8 @@ class IKSolver(IKSolverConfig):
         Returns:
             seed joint configurations for optimization.
         """
+        # print("[ik_solver] seed_config: ", seed_config, ", num_seeds: ", num_seeds)
+
         if seed_config is None:
             coord_position_seed = self.generate_seed(
                 num_seeds=num_seeds,
@@ -1229,9 +1294,13 @@ class IKSolver(IKSolverConfig):
         num_seeds: Optional[int] = None,
         use_nn_seed: bool = True,
         newton_iters: Optional[int] = None,
+        link_poses: Optional[Dict[str, Pose]] = None,
+        robot_jac: TorchJacobian= None,
+        q_init: Optional[torch.Tensor] = None,
     ) -> IKResult:  # pragma : no cover
         """Deprecated API for solving single or batch problems."""
         log_warn("IKSolver.solve() is deprecated, use solve_single() or others instead")
+        # print(goal_pose.batch, goal_pose.n_goalset)
         if goal_pose.batch == 1 and goal_pose.n_goalset == 1:
             return self.solve_single(
                 goal_pose,
@@ -1241,6 +1310,9 @@ class IKSolver(IKSolverConfig):
                 num_seeds,
                 use_nn_seed,
                 newton_iters,
+                link_poses,
+                robot_jac = robot_jac,
+                q_init = q_init,
             )
         if goal_pose.batch > 1 and goal_pose.n_goalset == 1:
             return self.solve_batch(
@@ -1251,8 +1323,12 @@ class IKSolver(IKSolverConfig):
                 num_seeds,
                 use_nn_seed,
                 newton_iters,
+                link_poses,
+                robot_jac=robot_jac,
+                q_init=q_init,
             )
         if goal_pose.batch > 1 and goal_pose.n_goalset > 1:
+            print("Using solve_batch_goalset!")
             return self.solve_batch_goalset(
                 goal_pose,
                 retract_config,
@@ -1261,8 +1337,12 @@ class IKSolver(IKSolverConfig):
                 num_seeds,
                 use_nn_seed,
                 newton_iters,
+                link_poses,
+                robot_jac=robot_jac,
+                q_init=q_init,
             )
         if goal_pose.batch == 1 and goal_pose.n_goalset > 1:
+            print("Using solve_goalset!" )
             return self.solve_goalset(
                 goal_pose,
                 retract_config,
@@ -1271,6 +1351,9 @@ class IKSolver(IKSolverConfig):
                 num_seeds,
                 use_nn_seed,
                 newton_iters,
+                link_poses,
+                robot_jac=robot_jac,
+                q_init=q_init,
             )
 
     def batch_env_solve(
@@ -1320,6 +1403,7 @@ class IKSolver(IKSolverConfig):
         Returns:
             Success of IK optimization as a boolean tensor of shape (batch, num_seeds).
         """
+        # print("RESULT", metrics.feasible, metrics.position_error, metrics.rotation_error)
         success = get_success(
             metrics.feasible,
             metrics.position_error,
@@ -1363,6 +1447,7 @@ class IKSolver(IKSolverConfig):
                 num_random_seeds * batch,
                 bounded=True,
             ).view(batch, num_random_seeds, self.dof)
+            print('[ik_solver] random_seed by seed generation: ', random_seed.shape)
             seed_list.append(random_seed)
         coord_position_seed = torch.cat(seed_list, dim=1)
         return coord_position_seed
@@ -1592,11 +1677,18 @@ def get_success(
 ):
     """JIT compatible function to get the success of IK solutions."""
     feasible = feasible.view(-1, num_seeds)
+    # print("position_error: ", position_error, "rotation error:", rotation_error)
     converge = torch.logical_and(
         position_error <= position_threshold,
         rotation_error <= rotation_threshold,
     ).view(-1, num_seeds)
+    # print("DEBUG: feasible: ", feasible, ", converge: ", converge)
+
+    print("DEBUG: feasible: ", torch.any(feasible), ", converge: ", torch.any(converge))
     success = torch.logical_and(feasible, converge)
+    # print("DEBUG: success: ", success)
+
+    print("DEBUG: success: ", torch.any(success))
     return success
 
 
@@ -1612,18 +1704,77 @@ def get_result(
     batch_size: int,
     return_seeds: int,
     num_seeds: int,
+    q_init: torch.Tensor
 ):
     """JIT compatible function to get the best IK solutions."""
     error = pose_error.view(-1, num_seeds)
-    error[~success] += 1000.0
+    # print("error: ", error, "success", success)
+    error[~success] += 1000000 # 1000.0
+    # print("error after success calculation: ", error)
+
     _, idx = torch.topk(error, k=return_seeds, largest=False, dim=-1)
+    # print("idx", idx)
     idx = idx + num_seeds * col.unsqueeze(-1)
+    # print("idx", idx)
     q_sol = sol_position[idx].view(batch_size, return_seeds, -1)
+
+    # CALCULATE TRAJECTORY DURATION FOR EACH SOLUTION (TOPPRA)
+    # print("q_sol:", q_sol.shape)
+    #
+    # print("success", success)
+    # print("success q_sol",sol_position.shape, sol_position[success.squeeze()])
+    # success_cpu = success.squeeze().detach().cpu().numpy()
+    #
+    # success_position = sol_position.detach().cpu().numpy()[success_cpu]
+    # joint_angles = q_init.detach().cpu().numpy()
+    # pose_error_cpu = pose_error.detach().cpu().numpy()[success_cpu]
+    #
+    # print("success_position: ", success_position.shape)
+    #
+    # if success_position.shape[0] != 0:
+    #     duration_min = 10
+    #     index = None
+    #     for i in range(success_position.shape[0]):
+    #         duration = calculate_trajectory_duration(joint_angles, success_position[i])
+    #         p_e = pose_error_cpu[i]
+    #         if (duration) < duration_min:
+    #             index = i
+    #             duration_min = duration
+    #         print("____________________________duration: ", duration, p_e)
+    #     print("_____________index: ", index, success_position[index])
+    #     q_sol = torch.tensor(success_position[index], device=error.device).unsqueeze(0).unsqueeze(0)
+    #     print("q_sol:", q_sol.shape)
+
 
     success = success.view(-1)[idx].view(batch_size, return_seeds)
     position_error = position_error[idx].view(batch_size, return_seeds)
+    # print("position_error: ", position_error)
     rotation_error = rotation_error[idx].view(batch_size, return_seeds)
     total_error = position_error + rotation_error
+    # print("return q_sol", q_sol, ", success: ", success, ", position_error: ", position_error, ", rotation_error: ", rotation_error, ", total_error: ", total_error)
     if goalset_index is not None:
         goalset_index = goalset_index[idx].view(batch_size, return_seeds)
     return q_sol, success, position_error, rotation_error, total_error, goalset_index
+
+def calculate_trajectory_duration(joint_angles, joint_goal_angles):
+    # way_pts = np.concatenate((joint_goal_angles[0, :6], np.array([0])))
+    way_pts = np.array([joint_angles, joint_goal_angles])
+    # print(way_pts)
+
+    traj = toppra_solver(way_pts)
+    ground_truth_duration = traj.duration
+
+    return ground_truth_duration
+
+def toppra_solver(way_pts):
+    ss = np.linspace(0, 1, 2)
+    # vlims = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100])
+    # alims = np.array([15, 7.5, 10, 12.5, 15, 20, 20])
+    vlims = np.array([3.15, 3.15, 3.15, 3.2, 3.2, 3.2, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, ])
+    alims = np.array([5.0, 5.0, 3.0, 2.0, 2.0, 2.0, 5.0, 5.0, 3.0, 2.0, 2.0, 2.0, 2.0])
+    path = ta.SplineInterpolator(ss, way_pts)
+    pc_vel = constraint.JointVelocityConstraint(vlims)
+    pc_acc = constraint.JointAccelerationConstraint(alims)
+    instance = algo.TOPPRA([pc_vel, pc_acc], path, parametrizer="ParametrizeConstAccel")
+    jnt_traj = instance.compute_trajectory()
+    return jnt_traj

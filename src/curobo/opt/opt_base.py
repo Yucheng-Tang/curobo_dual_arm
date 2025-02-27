@@ -28,6 +28,9 @@ from curobo.types.base import TensorDeviceType
 from curobo.util.logger import log_info
 from curobo.util.torch_utils import is_cuda_graph_available
 
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
+
 
 @dataclass
 class OptimizerConfig:
@@ -150,8 +153,10 @@ class Optimizer(OptimizerConfig):
         self._rollout_list = None
         self.debug = []
         self.debug_cost = []
+        self.robot_jac = TorchJacobian()
+        self.q_init = torch.Tensor()
 
-    def optimize(self, opt_tensor: torch.Tensor, shift_steps=0, n_iters=None) -> torch.Tensor:
+    def optimize(self, opt_tensor: torch.Tensor, shift_steps=0, n_iters=None,  robot_jac: TorchJacobian=None, q_init: torch.Tensor=None) -> torch.Tensor:
         """Find a solution through optimization given the initial values for variables.
 
         Args:
@@ -167,10 +172,13 @@ class Optimizer(OptimizerConfig):
             n_iters = self.cold_start_n_iters
             self.COLD_START = False
         st_time = time.time()
-        out = self._optimize(opt_tensor, shift_steps, n_iters)
+
+        out = self._optimize(opt_tensor, shift_steps, n_iters,  robot_jac, q_init)
         if self.sync_cuda_time:
             torch.cuda.synchronize(device=self.tensor_args.device)
         self.opt_dt = time.time() - st_time
+        log_info("Opt time without warmup: "+ str(self.opt_dt))
+
         return out
 
     def update_params(self, goal: Goal):
@@ -237,7 +245,7 @@ class Optimizer(OptimizerConfig):
         return self._rollout_list
 
     @abstractmethod
-    def _optimize(self, opt_tensor: torch.Tensor, shift_steps=0, n_iters=None) -> torch.Tensor:
+    def _optimize(self, opt_tensor: torch.Tensor, shift_steps=0, n_iters=None, robot_jac: TorchJacobian=None, q_init: torch.Tensor=None) -> torch.Tensor:
         """Implement this function in a derived class containing the solver.
 
         Args:

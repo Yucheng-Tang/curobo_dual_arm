@@ -323,6 +323,8 @@ namespace Curobo
           distance += position_weight * position_distance;
         }
       }
+
+//       printf("distance: %f, %f, %f)\n", distance, position_distance, rotation_distance);
     }
 
     template<typename scalar_t>
@@ -412,6 +414,8 @@ namespace Curobo
       const int batch_idx = t_idx / horizon;
       const int h_idx     = t_idx - (batch_idx * horizon);
 
+//       printf("Thread %d, h_idx = %d\n", t_idx, h_idx);
+
       if ((batch_idx >= batch_size) || (h_idx >= horizon))
       {
         return;
@@ -422,6 +426,12 @@ namespace Curobo
         *(float3 *)&current_position[batch_idx * horizon * 3 + h_idx * 3];
       float4 quat_4 = *(float4 *)&current_quat[batch_idx * horizon * 4 + h_idx * 4];
       float4 quat   = make_float4(quat_4.y, quat_4.z, quat_4.w, quat_4.x);
+
+      // Print position
+//       printf("Thread %d, Position: (%f, %f, %f)\n", t_idx, position.x, position.y, position.z);
+
+      // Print quaternion
+//       printf("Thread %d, Quaternion: (%f, %f, %f, %f)\n", t_idx, quat.x, quat.y, quat.z, quat.w);
 
       // read weights:
       float rotation_weight          = weight[0];
@@ -521,8 +531,12 @@ namespace Curobo
                                                             offset_rotation,
                                                             reach_offset);
 
+//         printf("Thread %d, best distance: %f, pose_distance %f)\n", t_idx, best_distance, pose_distance);
+
         if (pose_distance <= best_distance)
         {
+//           printf("position_distance %f, rotation_distance %f)\n", position_distance, rotation_distance);
+
           best_idx               = k;
           best_distance          = pose_distance;
           best_position_distance = position_distance;
@@ -535,6 +549,8 @@ namespace Curobo
             for (int i = 0; i < 6; i++)
             {
               best_distance_vec[i] = distance_vec[i];
+//               printf("best_distance_vec: %d th, %f)\n", i, best_distance_vec[i]);
+
             }
           }
         }
@@ -569,6 +585,8 @@ namespace Curobo
           rotation_weight = 1;
         }
 
+//         printf("best_position_distance before processing: %f\n", best_position_distance);
+
         if (best_position_distance > 0)
         {
           if (use_metric)
@@ -577,11 +595,16 @@ namespace Curobo
               (p_w_alpha * position_weight *
                sinhf(p_w_alpha * best_position_distance)) /
               (best_position_distance * coshf(p_w_alpha * best_position_distance));
+//               printf("best_position_distance during processing: %f, p_w_alpha: %f, position_weight: %f\n", best_position_distance, p_w_alpha, position_weight);
           }
           else
           {
             best_position_distance = (position_weight / best_position_distance);
+//             printf("best_position_distance during processing: %f\n", best_position_distance);
+
           }
+
+//            printf("best_position_distance: %f\n", best_position_distance);
 
           out_p_vec[batch_idx * horizon * 3 + h_idx * 3] =
             best_distance_vec[0] * best_position_distance;
@@ -596,6 +619,9 @@ namespace Curobo
           out_p_vec[batch_idx * horizon * 3 + h_idx * 3 + 1] = 0.0;
           out_p_vec[batch_idx * horizon * 3 + h_idx * 3 + 2] = 0.0;
         }
+
+//         printf("out_p_vec: %f, %f, %f)\n", out_p_vec[batch_idx * horizon * 3 + h_idx * 3], out_p_vec[batch_idx * horizon * 3 + h_idx * 3 + 1], out_p_vec[batch_idx * horizon * 3 + h_idx * 3 + 2]);
+
 
         if (best_rotation_distance > 0)
         {

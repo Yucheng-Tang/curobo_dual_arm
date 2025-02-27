@@ -38,6 +38,9 @@ from curobo.util.sample_lib import HaltonGenerator
 from curobo.util.tensor_util import copy_tensor
 from curobo.util.torch_utils import get_torch_jit_decorator
 
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
+
 
 @dataclass
 class RolloutMetrics(Sequence):
@@ -421,7 +424,7 @@ class RolloutConfig:
 
 
 class RolloutBase:
-    def __init__(self, config: Optional[RolloutConfig] = None):
+    def __init__(self, config: Optional[RolloutConfig] = None, robot_jac: TorchJacobian=None, q_init: Optional[torch.Tensor] = None):
         self.start_state = None
         self.batch_size = 1
         self._metrics_cuda_graph_init = False
@@ -430,6 +433,10 @@ class RolloutBase:
         self.cu_rollout_constraint_graph = None
         if config is not None:
             self.tensor_args = config.tensor_args
+        if robot_jac is not None:
+            self.robot_jac = robot_jac
+        if q_init is not None:
+            self.q_init = q_init
 
     def _init_after_config_load(self):
         self.act_sample_gen = HaltonGenerator(
@@ -464,7 +471,7 @@ class RolloutBase:
     def get_metrics_cuda_graph(self, state: State):
         return self.get_metrics(state)
 
-    def rollout_fn(self, act):
+    def rollout_fn(self, act, robot_jac, q_init):
         pass
 
     def current_cost(self, current_state):
@@ -474,8 +481,8 @@ class RolloutBase:
     def update_params(self, goal: Goal):
         return
 
-    def __call__(self, act: T_BHDOF_float) -> Trajectory:
-        return self.rollout_fn(act)
+    def __call__(self, act: T_BHDOF_float, robot_jac: TorchJacobian, q_init: torch.Tensor) -> Trajectory:
+        return self.rollout_fn(act, robot_jac, q_init)
 
     @abstractproperty
     def action_bounds(self):

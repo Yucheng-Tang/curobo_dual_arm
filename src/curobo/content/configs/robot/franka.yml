@@ -34,6 +34,7 @@ robot_cfg:
     asset_root_path: "robot/franka_description"
     base_link: "panda_link0"
     ee_link: "panda_hand"
+    link_names: ["panda_hand"] # , "tool2"] #, "tool3"]
     collision_link_names:
       [
         "panda_link0",

@@ -21,6 +21,13 @@ from curobo.types.math import Pose
 from curobo.types.robot import RobotConfig
 from curobo.util_file import get_robot_configs_path, get_world_configs_path, join_path, load_yaml
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
+from torch.profiler import ProfilerActivity, profile, record_function
+
+from curobo.util.logger import log_info, setup_logger
+
+import math
 
 torch.backends.cudnn.benchmark = True
 
@@ -31,35 +38,57 @@ torch.backends.cudnn.allow_tf32 = True
 def demo_basic_ik():
     tensor_args = TensorDeviceType()
 
-    config_file = load_yaml(join_path(get_robot_configs_path(), "ur10e.yml"))
+    config_file = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
     urdf_file = config_file["robot_cfg"]["kinematics"][
         "urdf_path"
     ]  # Send global path starting with "/"
     base_link = config_file["robot_cfg"]["kinematics"]["base_link"]
     ee_link = config_file["robot_cfg"]["kinematics"]["ee_link"]
-    robot_cfg = RobotConfig.from_basic(urdf_file, base_link, ee_link, tensor_args)
+    link_names = config_file["robot_cfg"]["kinematics"]["link_names"]
+    robot_cfg = RobotConfig.from_basic(urdf_file, base_link, ee_link, link_names, tensor_args)
 
     ik_config = IKSolverConfig.load_from_robot_config(
         robot_cfg,
         None,
         rotation_threshold=0.05,
         position_threshold=0.005,
-        num_seeds=20,
+        num_seeds=4,
         self_collision_check=False,
         self_collision_opt=False,
         tensor_args=tensor_args,
-        use_cuda_graph=True,
+        use_cuda_graph=False,
     )
+
+    print("ik_config loaded!")
+
     ik_solver = IKSolver(ik_config)
 
     # print(kin_state)
-    for _ in range(10):
-        q_sample = ik_solver.sample_configs(100)
+    for _ in range(1):
+        # q_sample = ik_solver.sample_configs(100)open("../src/curobo/content/assets/"+urdf_file).read(), ee_link
+        # kin_state = ik_solver.fk(q_sample)
+        # goal = Pose(kin_state.ee_position, kin_state.ee_quaternion)
+
+        # st_time = time.time()
+        # result = ik_solver.solve_batch(goal)
+
+        q_sample = ik_solver.sample_configs(1)
+        print("q_sample", q_sample)
         kin_state = ik_solver.fk(q_sample)
         goal = Pose(kin_state.ee_position, kin_state.ee_quaternion)
+        print("goal", goal)
+
+
+        robot_jac = TorchJacobian()
+        # robot_jac = None
 
         st_time = time.time()
-        result = ik_solver.solve_batch(goal)
+        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        result = ik_solver.solve(goal, robot_jac=robot_jac)
+
+        # print(prof.key_averages().table(sort_by="self_cpu_time_total"))
+
+        print("result: ", result.js_solution)
         torch.cuda.synchronize()
         print(
             "Success, Solve Time(s), hz ",
@@ -69,6 +98,7 @@ def demo_basic_ik():
             torch.mean(result.position_error),
             torch.mean(result.rotation_error),
         )
+
 
 
 def demo_full_config_collision_free_ik():
@@ -89,7 +119,7 @@ def demo_full_config_collision_free_ik():
         self_collision_check=True,
         self_collision_opt=True,
         tensor_args=tensor_args,
-        use_cuda_graph=True,
+        use_cuda_graph=False,
         # use_fixed_samples=True,
     )
     ik_solver = IKSolver(ik_config)
@@ -229,6 +259,8 @@ def demo_full_config_batch_env_collision_free_ik():
 
 
 if __name__ == "__main__":
+    setup_logger(level="info")
+
     demo_basic_ik()
     # demo_full_config_collision_free_ik()
     # demo_full_config_batch_env_collision_free_ik()

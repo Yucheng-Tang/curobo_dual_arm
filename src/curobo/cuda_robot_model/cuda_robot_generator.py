@@ -212,7 +212,6 @@ class CudaRobotGeneratorConfig:
         if isinstance(self.cspace, Dict):
             self.cspace = CSpaceConfig(**self.cspace, tensor_args=self.tensor_args)
 
-
 class CudaRobotGenerator(CudaRobotGeneratorConfig):
     def __init__(self, config: CudaRobotGeneratorConfig) -> None:
         super().__init__(**vars(config))

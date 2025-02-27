@@ -19,6 +19,9 @@ import torch
 # Local Folder
 from .cost_base import CostBase, CostConfig
 
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
+
 
 @dataclass
 class ManipulabilityCostConfig(CostConfig):
@@ -51,16 +54,23 @@ class ManipulabilityCost(CostBase, ManipulabilityCostConfig):
             else:
                 self.cost_fn = self.manipulability
 
-    def forward(self, jac_batch, q, qdot):
+    def forward(self, jac_batch, q, qdot, robot_jac=None):
         b, h, n = q.shape
-        if self.use_nn:
-            q = q.view(b * h, n)
+        # if self.use_nn:
+        #     q = q.view(b * h, n)
         score = self.cost_fn(q, jac_batch, qdot)
-        if self.use_nn:
-            score = score.view(b, h)
-        score[score > self.hinge_value] = self.hinge_value
+        # score = Manipulability.apply(q, jac_batch, qdot, robot_jac)
+
+        print(score.shape)
+        # if self.use_nn:
+        #     score = score.view(b, h)
+        print(score.dtype, self.hinge_value.dtype)
+        # score[score > self.hinge_value] = self.hinge_value
+        score = torch.clamp(score, max=self.hinge_value)
         score = (self.hinge_value / score) - 1
         cost = self.weight * score
+
+
 
         return cost
 
@@ -105,3 +115,85 @@ class ManipulabilityCost(CostBase, ManipulabilityCostConfig):
         score = min_score / max_score
         score[score != score] = 0.0
         return score
+
+class Manipulability(torch.autograd.Function):
+    @staticmethod
+    def forward(
+            ctx,
+            q: torch.Tensor,
+            jac_batch: torch.Tensor,
+            qdot: torch.Tensor,
+            robot_jac: TorchJacobian,
+    ):
+        """Compute manipulability score and cost
+
+        Args:
+            ctx: context object for saving tensors for backward pass
+            q: joint positions
+            jac_batch: batch of Jacobians
+            qdot: joint velocities
+
+        Returns:
+            cost: manipulability cost
+        """
+        b, h, n = q.shape
+        with torch.cuda.amp.autocast(enabled=False):
+            J_J_t = torch.matmul(jac_batch, jac_batch.transpose(-2, -1))
+            score = torch.sqrt(torch.det(J_J_t))
+
+        score[score != score] = 0.0  # Handle NaNs
+
+        hessian = robot_jac.calc_hessian(q)
+
+        ctx.save_for_backward(score, jac_batch, q, qdot, hessian)
+
+        return score
+
+    @staticmethod
+    def backward(ctx):
+        score, jac_batch, q, qdot, hessian= ctx.saved_tensors
+
+        b, h, n = q.shape
+
+        grad_q = grad_jac_batch = grad_qdot = None
+
+        if ctx.needs_input_grad[1]:
+            grad_jac_batch = jac_batch + jac_batch.transpose(-2, -1)
+
+        if ctx.needs_input_grad[0]:
+            hessian_transpose = hessian.transpose(-2, -1)
+            grad_q = hessian + hessian_transpose
+
+        # # Calculate the gradient of the score with respect to the Jacobian
+        # if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+        #     grad_jac_batch = torch.zeros_like(jac_batch)
+        #     grad_q = torch.zeros_like(q)
+        #
+        #     for i in range(b):
+        #         for j in range(h):
+        #             J = jac_batch[i, j]
+        #             J_J_t = torch.matmul(J, J.transpose(-2, -1))
+        #             device = J_J_t.device
+        #             identity_matrix = torch.eye(J_J_t.size(-1)).to(device) * 1e-6
+        #             J_J_t_inv = torch.inverse(
+        #                 J_J_t + identity_matrix)  # Regularization for stability
+        #             grad_score = 0.5 * torch.det(J_J_t) ** (-0.5) * torch.inverse(
+        #                 J_J_t + identity_matrix)
+        #             grad_jac = torch.matmul(grad_score, J)
+        #             grad_jac_batch[i, j] = grad_jac
+        #
+        #             # Chain rule to compute gradient with respect to q
+        #             for k in range(n):
+        #                 grad_q[i, j, k] = torch.sum(grad_jac *
+        #                                             torch.autograd.grad(J, q, grad_outputs=torch.ones_like(J),
+        #                                                                 retain_graph=True)[0][i, j, k])
+        #
+        #     grad_jac_batch *= grad_output.unsqueeze(-1).unsqueeze(
+        #         -1)  # Adjust gradient with respect to the output gradient
+        #     grad_q *= grad_output.unsqueeze(-1)  # Adjust gradient with respect to the output gradient
+        #
+        # # Placeholder for gradients w.r.t qdot if necessary
+        # if ctx.needs_input_grad[2]:
+        #     grad_qdot = torch.zeros_like(qdot)
+
+        return grad_q, grad_jac_batch, None

@@ -150,6 +150,8 @@ class KinematicsFusedFunction(Function):
                 use_global_cumul=ctx.use_global_cumul,
             )
 
+        # print("!!!!!!__________", grad_joint, "__________")
+
         return (
             None,
             None,
@@ -263,3 +265,9 @@ def get_cuda_kinematics(
         use_global_cumul,
     )
     return link_pos, link_quat, robot_spheres
+
+
+# def get_cuda_jacobian():
+#     # out = KinematicsFusedFunction.backward()
+#
+#     return out

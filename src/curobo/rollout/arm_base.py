@@ -42,6 +42,8 @@ from curobo.types.state import JointState
 from curobo.util.logger import log_error, log_info, log_warn
 from curobo.util.tensor_util import cat_sum, cat_sum_horizon
 
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
 
 @dataclass
 class ArmCostConfig:
@@ -91,6 +93,7 @@ class ArmCostConfig:
         data = {}
         for k in cost_key_list:
             if k in data_dict:
+                print(k, data_dict[k])
                 data[k] = cost_key_list[k](**data_dict[k], tensor_args=tensor_args)
         if "primitive_collision_cfg" in data_dict and world_coll_checker is not None:
             data["primitive_collision_cfg"] = PrimitiveCollisionCostConfig(
@@ -335,7 +338,7 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         self.update_cost_dt(self.dynamics_model.dt_traj_params.base_dt)
         return RolloutBase._init_after_config_load(self)
 
-    def cost_fn(self, state: KinematicModelState, action_batch=None, return_list=False):
+    def cost_fn(self, state: KinematicModelState, action_batch=None, return_list=False, robot_jac=None, q_init=None):
         # ee_pos_batch, ee_rot_batch = state_dict["ee_pos_seq"], state_dict["ee_rot_seq"]
         state_batch = state.state_seq
         cost_list = []
@@ -350,7 +353,16 @@ class ArmBase(RolloutBase, ArmBaseConfig):
                 )
                 cost_list.append(c)
         if self.cost_cfg.manipulability_cfg is not None and self.manipulability_cost.enabled:
-            raise NotImplementedError("Manipulability Cost is not implemented")
+            with profiler.record_function("cost/manipulability"):
+                # print("_____debug_____: ", state.lin_jac_seq.shape, state.ang_jac_seq.shape)
+            # raise NotImplementedError("Manipulability Cost is not implemented")
+                if state.lin_jac_seq is not None and state.ang_jac_seq is not None:
+                    jac_batch = torch.cat((state.lin_jac_seq, state.ang_jac_seq), dim=-2)
+                    manipulability_cost = self.manipulability_cost.forward(jac_batch, state_batch.position, state_batch.velocity, robot_jac=robot_jac)
+                    cost_list.append(manipulability_cost)
+                else:
+                    raise ValueError(
+                        "Both lin_jac_seq and ang_jac_seq must be available for manipulability cost calculation.")
         if self.cost_cfg.stop_cfg is not None and self.stop_cost.enabled:
             st_cost = self.stop_cost.forward(state_batch.velocity)
             cost_list.append(st_cost)
@@ -419,7 +431,7 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         out_metrics.constraint = constraint
         return out_metrics
 
-    def get_metrics(self, state: Union[JointState, KinematicModelState]):
+    def get_metrics(self, state: Union[JointState, KinematicModelState], robot_jac: TorchJacobian=None, q_init=None):
         """Compute metrics given state
             #TODO: Currently does not compute velocity and acceleration costs.
         Args:
@@ -429,15 +441,19 @@ class ArmBase(RolloutBase, ArmBaseConfig):
             _type_: _description_
 
         """
+        # print("get metrics")
         if isinstance(state, JointState):
-            state = self._get_augmented_state(state)
+            state = self._get_augmented_state(state, robot_jac=robot_jac)
         out_metrics = self.constraint_fn(state)
+        # print("get metrics", out_metrics)
         out_metrics.state = state
-        out_metrics = self.convergence_fn(state, out_metrics)
-        out_metrics.cost = self.cost_fn(state)
+        out_metrics = self.convergence_fn(state, out_metrics, q_init=q_init)
+        # print("get metrics", out_metrics)
+        out_metrics.cost = self.cost_fn(state, robot_jac=robot_jac, q_init=q_init)
+        # print("get metrics", out_metrics)
         return out_metrics
 
-    def get_metrics_cuda_graph(self, state: JointState):
+    def get_metrics_cuda_graph(self, state: JointState, robot_jac: TorchJacobian=None):
         """Use a CUDA Graph to compute metrics
 
         Args:
@@ -456,11 +472,11 @@ class ArmBase(RolloutBase, ArmBaseConfig):
             s.wait_stream(torch.cuda.current_stream(device=self.tensor_args.device))
             with torch.cuda.stream(s):
                 for _ in range(3):
-                    self._cu_out_metrics = self.get_metrics(self._cu_metrics_state_in)
+                    self._cu_out_metrics = self.get_metrics(self._cu_metrics_state_in, robot_jac)
             torch.cuda.current_stream(device=self.tensor_args.device).wait_stream(s)
             self.cu_metrics_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.cu_metrics_graph, stream=s):
-                self._cu_out_metrics = self.get_metrics(self._cu_metrics_state_in)
+                self._cu_out_metrics = self.get_metrics(self._cu_metrics_state_in, robot_jac)
             self._metrics_cuda_graph_init = True
         if self._cu_metrics_state_in.position.shape != state.position.shape:
             log_error("cuda graph changed")
@@ -471,14 +487,14 @@ class ArmBase(RolloutBase, ArmBaseConfig):
 
     @abstractmethod
     def convergence_fn(
-        self, state: KinematicModelState, out_metrics: Optional[RolloutMetrics] = None
+        self, state: KinematicModelState, out_metrics: Optional[RolloutMetrics] = None, q_init = None
     ):
         if out_metrics is None:
             out_metrics = RolloutMetrics()
         return out_metrics
 
-    def _get_augmented_state(self, state: JointState) -> KinematicModelState:
-        aug_state = self.compute_kinematics(state)
+    def _get_augmented_state(self, state: JointState, robot_jac: TorchJacobian) -> KinematicModelState:
+        aug_state = self.compute_kinematics(state, robot_jac)
         if len(aug_state.state_seq.position.shape) == 2:
             aug_state.state_seq = aug_state.state_seq.unsqueeze(1)
             aug_state.ee_pos_seq = aug_state.ee_pos_seq.unsqueeze(1)
@@ -492,7 +508,7 @@ class ArmBase(RolloutBase, ArmBaseConfig):
             aug_state.link_quat_seq = aug_state.link_quat_seq.unsqueeze(1)
         return aug_state
 
-    def compute_kinematics(self, state: JointState) -> KinematicModelState:
+    def compute_kinematics(self, state: JointState, robot_jac) -> KinematicModelState:
         # assume input is joint state?
         h = 0
         current_state = state  # .detach().clone()
@@ -512,7 +528,7 @@ class ArmBase(RolloutBase, ArmBaseConfig):
             link_pos_seq,
             link_rot_seq,
             link_spheres,
-        ) = self.dynamics_model.robot_model.forward(q)
+        ) = self.dynamics_model.robot_model.forward(q, calculate_jacobian=True, robot_jac=robot_jac)
 
         if h != 0:
             ee_pos_seq = ee_pos_seq.view(b, h, 3)
@@ -571,7 +587,7 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         out_metrics = self._cu_rollout_constraint_out_metrics
         return out_metrics.clone()
 
-    def rollout_fn(self, act_seq) -> Trajectory:
+    def rollout_fn(self, act_seq, robot_jac, q_init) -> Trajectory:
         """
         Return sequence of costs and states encountered
         by simulating a batch of action sequences
@@ -580,17 +596,25 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         ----------
         action_seq: torch.Tensor [num_particles, horizon, d_act]
         """
+        # print("[rollout arm base] ", act_seq.shape)
 
         # print(act_seq.shape, self._goal_buffer.batch_current_state_idx)
         if self.start_state is None:
             raise ValueError("start_state is not set in rollout")
         with profiler.record_function("robot_model/rollout"):
+            # print("forward calculation")
             state = self.dynamics_model.forward(
-                self.start_state, act_seq, self._goal_buffer.batch_current_state_idx
+                self.start_state, act_seq, self._goal_buffer.batch_current_state_idx, robot_jac=robot_jac
             )
 
         with profiler.record_function("cost/all"):
-            cost_seq = self.cost_fn(state, act_seq)
+            # print("cost calculation")
+
+            cost_seq = self.cost_fn(state, act_seq, robot_jac=robot_jac, q_init=q_init)
+
+        # print("___________________act_seq________________________", act_seq)
+        # print("___________________cost_seq________________________", cost_seq)
+        # print("___________________state________________________", state)
 
         sim_trajs = Trajectory(actions=act_seq, costs=cost_seq, state=state)
 
@@ -626,13 +650,13 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         state = KinematicModelState(current_state, ee_pos_batch, ee_quat_batch)
         return state
 
-    def current_cost(self, current_state: JointState, no_coll=False, return_state=True, **kwargs):
-        state = self._get_augmented_state(current_state)
+    def current_cost(self, current_state: JointState, no_coll=False, return_state=True, robot_jac=None, q_init=None, **kwargs):
+        state = self._get_augmented_state(current_state, robot_jac)
 
         if "horizon_cost" not in kwargs:
             kwargs["horizon_cost"] = False
 
-        cost = self.cost_fn(state, None, no_coll=no_coll, **kwargs)
+        cost = self.cost_fn(state, None, no_coll=no_coll, robot_jac=robot_jac, q_init=q_init)
 
         if return_state:
             return cost, state

@@ -26,6 +26,8 @@ from curobo.types.base import TensorDeviceType
 from curobo.types.tensor import T_BHDOF_float, T_HDOF_float
 from curobo.util.logger import log_error, log_info
 
+from curobo.cuda_robot_model.cuda_robot_model import TorchJacobian
+
 
 class SampleMode(Enum):
     MEAN = 0
@@ -162,7 +164,7 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
         """
         return False
 
-    def generate_rollouts(self, init_act=None):
+    def generate_rollouts(self, init_act=None, robot_jac=None, q_init=None):
         """
         Samples a batch of actions, rolls out trajectories for each particle
         and returns the resulting observations, costs,
@@ -173,12 +175,17 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
         state : dict or np.ndarray
             Initial state to set the simulation problem to
         """
+        # print("[particle_opt_base] init_act: ",init_act)
 
         act_seq = self.sample_actions(init_act)
-        trajectories = self.rollout_fn(act_seq)
+
+        # print("[particle_opt_base] act_seq: ", act_seq.shape)
+        trajectories = self.rollout_fn(act_seq, robot_jac, q_init)
+
+        # print("[particle_opt_base] trajectories: ", trajectories.actions.shape)
         return trajectories
 
-    def _optimize(self, init_act: torch.Tensor, shift_steps=0, n_iters=None):
+    def _optimize(self, init_act: torch.Tensor, shift_steps=0, n_iters=None, robot_jac: TorchJacobian=None, q_init: torch.Tensor=None):
         """
         Optimize for best action at current state
 
@@ -201,28 +208,38 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
             dictionary with side-information
         """
 
+        log_info("using MPPI optimizer!")
         n_iters = n_iters if n_iters is not None else self.n_iters
 
         # create cuda graph:
         if self.use_cuda_graph and self.cu_opt_init:
+            log_info("using MPPI optimizer! After warming up!")
             curr_action_seq = self._call_cuda_opt_iters(init_act)
         else:
+            log_info("using MPPI optimizer! warming up!")
+
             curr_action_seq = self._run_opt_iters(
-                init_act, n_iters=n_iters, shift_steps=shift_steps
+                init_act, n_iters=n_iters, shift_steps=shift_steps, robot_jac=robot_jac, q_init=q_init
             )
         if self.use_cuda_graph:
             if not self.cu_opt_init:
-                self._initialize_cuda_graph(init_act, shift_steps=shift_steps)
+                log_info("using MPPI optimizer! create cuda graph!")
+                self._initialize_cuda_graph(init_act, shift_steps=shift_steps, robot_jac=robot_jac, q_init=q_init)
+        
+        # print('curr_action_seq for MPPI', curr_action_seq)
 
+        print("[particle opt base] optimization finished!")
+
+        print(self.num_steps)
         self.num_steps += 1
         if self.calculate_value:
-            trajectories = self.generate_rollouts(init_act)
+            trajectories = self.generate_rollouts(init_act, robot_jac=robot_jac, q_init=q_init)
             value = self._calc_val(trajectories)
             self.info["value"] = value
         # print(self.act_seq)
         return curr_action_seq
 
-    def _initialize_cuda_graph(self, init_act: T_HDOF_float, shift_steps=0):
+    def _initialize_cuda_graph(self, init_act: T_HDOF_float, shift_steps=0, robot_jac: TorchJacobian=None, q_init: torch.Tensor=None):
         log_info("ParticleOptBase: Creating Cuda Graph")
         self._cu_act_in = init_act.detach().clone()
 
@@ -231,14 +248,16 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
         s.wait_stream(torch.cuda.current_stream(device=self.tensor_args.device))
         with torch.cuda.stream(s):
             for _ in range(3):
-                self._cu_act_seq = self._run_opt_iters(self._cu_act_in, shift_steps=shift_steps)
+                print("[particle opt base] run opt iters 3 times!!!!!!!")
+                self._cu_act_seq = self._run_opt_iters(self._cu_act_in, shift_steps=shift_steps, robot_jac=robot_jac)
         torch.cuda.current_stream(device=self.tensor_args.device).wait_stream(s)
 
         self.reset()
         self.cu_opt_graph = torch.cuda.CUDAGraph()
 
         with torch.cuda.graph(self.cu_opt_graph, stream=s):
-            self._cu_act_seq = self._run_opt_iters(self._cu_act_in, shift_steps=shift_steps)
+            print("[particle opt base] getting _cu_act_seq!")
+            self._cu_act_seq = self._run_opt_iters(self._cu_act_in, shift_steps=shift_steps, robot_jac=robot_jac, q_init=q_init)
         self.cu_opt_init = True
 
     def _call_cuda_opt_iters(self, init_act: T_HDOF_float):
@@ -246,7 +265,7 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
         self.cu_opt_graph.replay()
         return self._cu_act_seq.detach().clone()  # .clone()
 
-    def _run_opt_iters(self, init_act: T_HDOF_float, shift_steps=0, n_iters=None):
+    def _run_opt_iters(self, init_act: T_HDOF_float, shift_steps=0, n_iters=None, robot_jac: TorchJacobian=None, q_init: torch.Tensor=None):
         n_iters = n_iters if n_iters is not None else self.n_iters
 
         self._shift(shift_steps)
@@ -254,9 +273,21 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
         if not self.use_cuda_graph and self.store_debug:
             self.debug.append(self._get_action_seq(mode=self.sample_mode).clone())
 
-        for _ in range(n_iters):
+        # robot_jac = TorchJacobian()
+        #
+        # q_grad = torch.rand(2, 7, dtype=torch.float32, device="cuda", requires_grad=True)
+        # link_pos_seq = torch.rand(2, 6, dtype=torch.float32, device="cuda", requires_grad=True)
+        # link_quat_seq = torch.rand(2, 6, dtype=torch.float32, device="cuda", requires_grad=True)
+        #
+        # lin_jac, ang_jac = robot_jac.get_jacobian(q_grad, link_pos_seq, link_quat_seq)
+
+        # print("_run_opt_iters: n_iters ", n_iters)
+        for i in range(n_iters):
+            # print("generate_rollouts ", i)
             # generate random simulated trajectories
-            trajectory = self.generate_rollouts()
+
+            trajectory = self.generate_rollouts(robot_jac=robot_jac, q_init=q_init)
+
             trajectory.actions = trajectory.actions.view(
                 self.n_problems, self.particles_per_problem, self.action_horizon, self.d_action
             )
@@ -265,6 +296,7 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
             )
             with profiler.record_function("mppi/update_distribution"):
                 self._update_distribution(trajectory)
+            # print("[particle opt base] trajectory: ", trajectory.actions[0][0][0][0], trajectory.state.state_seq.position[0][0][0])
             if not self.use_cuda_graph and self.store_debug:
                 self.debug.append(self._get_action_seq(mode=self.sample_mode).clone())
                 self.debug_cost.append(
@@ -272,6 +304,7 @@ class ParticleOptBase(Optimizer, ParticleOptConfig):
                 )
 
         curr_action_seq = self._get_action_seq(mode=self.sample_mode)
+        # print("[particle opt base] curr_action_seq: ", curr_action_seq)
         return curr_action_seq
 
     def update_nproblems(self, n_problems):

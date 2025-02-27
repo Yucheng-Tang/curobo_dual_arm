@@ -13,7 +13,7 @@ from __future__ import annotations
 # Standard Library
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 # CuRobo
 from curobo.cuda_robot_model.cuda_robot_generator import CudaRobotGeneratorConfig
@@ -53,10 +53,21 @@ class RobotConfig:
 
         return RobotConfig(**data_dict, tensor_args=tensor_args)
 
+    # @staticmethod
+    # def from_basic(urdf_path, base_link, ee_link, tensor_args=TensorDeviceType()):
+    #     cuda_robot_model_config = CudaRobotModelConfig.from_basic_urdf(
+    #         urdf_path, base_link, ee_link, tensor_args
+    #     )
+    #
+    #     return RobotConfig(
+    #         cuda_robot_model_config,
+    #         tensor_args=tensor_args,
+    #     )
+
     @staticmethod
-    def from_basic(urdf_path, base_link, ee_link, tensor_args=TensorDeviceType()):
+    def from_basic(urdf_path, base_link, ee_link, link_names: Optional[List[str]] =None, tensor_args=TensorDeviceType()):
         cuda_robot_model_config = CudaRobotModelConfig.from_basic_urdf(
-            urdf_path, base_link, ee_link, tensor_args
+            urdf_path, base_link, ee_link, link_names, tensor_args
         )
 
         return RobotConfig(

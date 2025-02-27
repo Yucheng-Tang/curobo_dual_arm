@@ -29,6 +29,7 @@ from curobo.util.logger import log_error
 # Local Folder
 from .cost_base import CostBase, CostConfig
 
+import pytorch3d.transforms
 
 class PoseErrorType(Enum):
     SINGLE_GOAL = 0  #: Distance will be computed to a single goal pose
@@ -358,12 +359,36 @@ class PoseCost(CostBase, PoseCostConfig):
     ):
         if link_name is None:
             goal_pose = goal.goal_pose
+            ee_goal_pos = goal_pose.position
+            ee_goal_rot = goal_pose.quaternion
+            num_goals = goal_pose.n_goalset
+        elif link_name == "relative_pose":
+            (
+                ee_goal_pos,
+                ee_goal_rot) = calculate_relative_pose(
+                        goal.links_goal_pose["zimmer_ee_iiwa"].position,
+                        goal.links_goal_pose["zimmer_ee_iiwa"].quaternion,
+                        goal.goal_pose.position,
+                        goal.goal_pose.quaternion)
+            # print("relative pose", ee_goal_pos, ee_goal_rot)
+            num_goals = goal.goal_pose.n_goalset
         else:
             goal_pose = goal.links_goal_pose[link_name]
+            ee_goal_pos = goal_pose.position
+            ee_goal_rot = goal_pose.quaternion
+            num_goals = goal_pose.n_goalset
 
-        ee_goal_pos = goal_pose.position
-        ee_goal_rot = goal_pose.quaternion
-        num_goals = goal_pose.n_goalset
+        # print("ee_goal_pose", ee_goal_pos,
+        #         ee_goal_rot)
+
+        # if link_name is None:
+        #     goal_pose = goal.goal_pose
+        # else:
+        #     goal_pose = goal.links_goal_pose[link_name]
+
+        # ee_goal_pos = goal_pose.position
+        # ee_goal_rot = goal_pose.quaternion
+        # num_goals = goal_pose.n_goalset
         self._update_cost_type(ee_goal_pos, ee_pos_batch, num_goals)
 
         b, h, _ = ee_pos_batch.shape
@@ -405,23 +430,42 @@ class PoseCost(CostBase, PoseCostConfig):
         g_dist = g_dist  # .view(b, h)
         idx = idx  # .view(b, h)
 
+        # print(cost, r_err, g_dist, idx)
+        # print("idx", idx)
+
         return cost, r_err, g_dist
 
     def forward(self, ee_pos_batch, ee_rot_batch, goal: Goal, link_name: Optional[str] = None):
+        # print("________calculating pose error________")
+
         if link_name is None:
             goal_pose = goal.goal_pose
+            ee_goal_pos = goal_pose.position
+            ee_goal_rot = goal_pose.quaternion
+            num_goals = goal_pose.n_goalset
+        elif link_name == "relative_pose":
+            (
+                ee_goal_pos,
+                ee_goal_rot) = calculate_relative_pose(
+                        goal.links_goal_pose["zimmer_ee_iiwa"].position,
+                        goal.links_goal_pose["zimmer_ee_iiwa"].quaternion,
+                        goal.goal_pose.position,
+                        goal.goal_pose.quaternion)
+            # print("relative pose", ee_goal_pos, ee_goal_rot)
+            num_goals = goal.goal_pose.n_goalset
         else:
             goal_pose = goal.links_goal_pose[link_name]
+            ee_goal_pos = goal_pose.position
+            ee_goal_rot = goal_pose.quaternion
+            num_goals = goal_pose.n_goalset
 
-        ee_goal_pos = goal_pose.position
-        ee_goal_rot = goal_pose.quaternion
-        num_goals = goal_pose.n_goalset
         self._update_cost_type(ee_goal_pos, ee_pos_batch, num_goals)
         # print(self.cost_type)
         b, h, _ = ee_pos_batch.shape
         self.update_batch_size(b, h)
         # return self.out_distance
         # print(b,h, ee_goal_pos.shape)
+        # print("ist and soll pose:", ee_pos_batch, ee_goal_pos, ee_rot_batch, ee_goal_rot)
 
         distance = PoseError.apply(
             ee_pos_batch,
@@ -454,6 +498,7 @@ class PoseCost(CostBase, PoseCostConfig):
         )
 
         cost = distance
+        # print("__________cost_____________", cost)
         # if link_name is None and cost.shape[0]==8:
         #    print(ee_pos_batch[...,-1].squeeze())
         # print(cost.shape)
@@ -505,3 +550,23 @@ class PoseCost(CostBase, PoseCostConfig):
             self.return_loss,
         )
         return distance
+
+def calculate_relative_pose(base_pos_batch, base_quat_batch, ee_pos_batch, ee_quat_batch):
+    ee_matrix_batch = pytorch3d.transforms.quaternion_to_matrix(ee_quat_batch)
+    base_matrix_batch = pytorch3d.transforms.quaternion_to_matrix(base_quat_batch)
+
+    current_matrix_batch_inv = base_matrix_batch.transpose(-2, -1)
+
+    # Compute the inverse of the translation vector
+    current_pos_inv = -torch.matmul(current_matrix_batch_inv, base_pos_batch.unsqueeze(-1)).squeeze(-1)
+
+    relative_rot_batch = torch.matmul(current_matrix_batch_inv, ee_matrix_batch)
+    relative_pos_batch = torch.matmul(current_matrix_batch_inv, ee_pos_batch.unsqueeze(-1)).squeeze(-1)
+
+    relative_ee_pos_batch = current_pos_inv + relative_pos_batch
+
+    relative_ee_quat_batch = pytorch3d.transforms.matrix_to_quaternion(relative_rot_batch)
+
+    # print("relative pos", relative_ee_pos_batch, "relative quat", relative_ee_quat_batch)
+
+    return relative_ee_pos_batch, relative_ee_quat_batch

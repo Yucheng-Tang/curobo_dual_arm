@@ -421,6 +421,7 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
                 raise ValueError("Unidentified covariance type in update_distribution")
 
     def _get_action_seq(self, mode: SampleMode):
+        print("[parallel_mppi] get action seq!")
         if mode == SampleMode.MEAN:
             act_seq = self.mean_action  # .clone()  # [self.mean_idx]#.clone()
         elif mode == SampleMode.SAMPLE:
@@ -597,8 +598,9 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
             #    self._sample_iter = sample_iter
             self._sample_iter_n = 0
 
+    # TODO： Why should here be no_grad!!!!!!!
     @torch.no_grad()
-    def generate_rollouts(self, init_act=None):
+    def generate_rollouts(self, init_act=None, robot_jac=None, q_init=None):
         """
         Samples a batch of actions, rolls out trajectories for each particle
         and returns the resulting observations, costs,
@@ -610,7 +612,7 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
             Initial state to set the simulation problem to
         """
 
-        return super().generate_rollouts(init_act)
+        return super().generate_rollouts(init_act, robot_jac=robot_jac, q_init=q_init)
 
 
 @get_torch_jit_decorator()
